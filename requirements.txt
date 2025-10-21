@@ -1,0 +1,5 @@
+dspy-ai==3.0.3
+crawl4ai==0.7.4
+langchain_text_splitters==0.3.11
+jupyter==1.0.0
+nbconvert[webpdf]
