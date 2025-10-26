@@ -3,3 +3,26 @@ crawl4ai==0.7.4
 langchain_text_splitters==0.3.11
 jupyter==1.0.0
 nbconvert[webpdf]
+nltk==3.9.1
+# Core dependencies
+numpy==1.26.4
+sentence-transformers==3.4.1
+scikit-learn==1.6.1
+torch>=2.0.0,<2.3.0
+transformers
+rank-bm25
+
+# LLM API clients
+openai
+litellm
+ollama
+
+# Evaluation metrics
+rouge-score
+bert-score
+
+# Utilities
+tqdm
+pandas
+pathlib
+python-dotenv

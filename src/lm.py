@@ -21,6 +21,7 @@ class LanguageModelProvider(IntEnum):
     LANGUAGE_MODEL_PROVIDER_AZURE_OPENAI = 1  # Azure OpenAI service
     LANGUAGE_MODEL_PROVIDER_OPENAI = 2        # Direct OpenAI API
     LANGUAGE_MODEL_PROVIDER_LITELLM_SERVER = 3  # LiteLLM proxy server
+    LANGUAGE_MODEL_PROVIDER_OLLAMA = 4
 
 
 # ---------- Provider-specific configuration classes ----------
