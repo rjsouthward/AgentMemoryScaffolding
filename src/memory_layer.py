@@ -15,14 +15,19 @@ import pickle
 from pathlib import Path
 from litellm import completion
 import time
-from src.lm import init_lm, LanguageModelProvider, LanguageModelProviderConfig, LiteLLMServerConfig
+from src.lm import init_lm, LanguageModelProvider, LanguageModelProviderConfig, LiteLLMServerConfig, LanguageModelProviderConfig
 import dspy
+from src.encoder import Encoder
+from dotenv import load_dotenv
+
+
 
 def simple_tokenize(text):
     return word_tokenize(text)
 
 class BaseLLMController(ABC):
     @abstractmethod
+    # Get completion may be a limiting factor as sometimes we want multiple inputs to the depy signature
     def get_completion(self, prompt: str, response_format: str) -> str:
         """Get completion from LLM"""
         pass
@@ -30,17 +35,22 @@ class BaseLLMController(ABC):
 
 class LiteLLMController(BaseLLMController):
     # response_format is legacy from the A-Mem paper – can remove. 
-    def __init__(self, lm_config: LanguageModelProviderConfig = LanguageModelProviderConfig(
+    def __init__(self, model: str = "openai/gpt-4.1-mini", temperature = 0.7):
+        config = LanguageModelProviderConfig(
       provider=LanguageModelProvider.LANGUAGE_MODEL_PROVIDER_LITELLM_SERVER,
-      model_name="gpt-4.1-mini",
-      temperature=0.2,
+      model_name= model,
+      temperature=temperature,
       max_tokens=5000,
       litellm_server_config=LiteLLMServerConfig(api_key=os.getenv("LITELLM_API_KEY"), api_base=os.getenv("LITELLM_API_BASE"))
-  )):
-        self.lm = init_lm(lm_config) 
+  )
+        # self.encoder = Encoder(model_name="text-embedding-3-small", **{"api_key": os.getenv("LITELLM_API_KEY"), "api_base": os.getenv("LITELLM_API_BASE")})
+        load_dotenv()
+        self.lm = init_lm(config) 
 
 
-    def get_completion(self, prompt: str, response_format: dspy.Signature) -> str:
+    def get_completion(self, prompt: str, response_format: dspy.Signature, temperature: float = 0.7) -> str:
+        # Currently we leave temperature at .7
+        # self.lm_config.temperature = temperature
         memory_agent = dspy.Predict(response_format)
         with dspy.context(lm = self.lm):
             result = memory_agent(content = prompt)
@@ -202,7 +212,6 @@ class MemoryNote:
             )
         try:
             response = llm_controller.llm.get_completion(content, response_format=AnalyzeContentSignature)
-            
             try:
                 analysis = json.loads(response)
             except:

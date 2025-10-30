@@ -1,0 +1,3 @@
+2025-10-27 16:11:52,311 - INFO - Loading dataset from /Users/rsouthward/Developer/AgentMemoryScaffolding/src/data/locomo10.json
+2025-10-27 16:11:52,524 - INFO - Loaded 10 samples
+2025-10-27 16:11:53,569 - INFO - No cached memories found for sample 0. Creating new memories.

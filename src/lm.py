@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, asdict, is_dataclass
 from dataclasses import fields as dc_fields
 from enum import IntEnum
 from typing import Optional, Any, Dict
+import os
 
 
 # ---------- Provider enumeration ----------

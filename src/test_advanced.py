@@ -19,6 +19,10 @@ import random
 from tqdm import tqdm
 from utils import calculate_metrics, aggregate_metrics
 from datetime import datetime
+import dspy
+from src.lm import init_lm, LanguageModelProvider, LanguageModelProviderConfig, LiteLLMServerConfig
+from copy import deepcopy
+
 
 # Download required NLTK data
 try:
@@ -53,34 +57,21 @@ class advancedMemAgent:
         return self.memory_system.find_related_memories_raw(content, k=k)
     
     def retrieve_memory_llm(self, memories_text, query):
-        prompt = f"""Given the following conversation memories and a question, select the most relevant parts of the conversation that would help answer the question. Include the date/time if available.
-
+        prompt = f"""
                 Conversation memories:
                 {memories_text}
 
                 Question: {query}
-
-                Return only the relevant parts of the conversation that would help answer this specific question. Format your response as a JSON object with a "relevant_parts" field containing the selected text. 
-                If no parts are relevant, do not do any things just return the input.
-
-                Example response format:
-                {{"relevant_parts": "2024-01-01: Speaker A said something relevant..."}}"""
+            """
             
             # Get LLM response
-        response = self.retriever_llm.llm.get_completion(prompt,response_format={"type": "json_schema", "json_schema": {
-                            "name": "response",
-                            "schema": {
-                                "type": "object",
-                                "properties": {
-                                    "relevant_parts": {
-                                        "type": "string",
-                                    }
-                                },
-                                "required": ["relevant_parts"],
-                                "additionalProperties": False
-                            },
-                            "strict": True
-                        }})
+        class RetrieveMemorySignature(dspy.Signature):
+            """Given the following conversation memories and a question, select the most relevant parts of the conversation that would help answer the question. Include the date/time if available."""
+            content: str = dspy.InputField()
+            relevant_parts: str = dspy.OutputField(
+                desc = "Return only the relevant parts of the conversation that would help answer this specific question. If no parts are relevant, do not do anything and return the input."
+            )
+        response = self.retriever_llm.llm.get_completion(prompt,response_format=RetrieveMemorySignature)
         # print("response:{}".format(response))
         return response
     
@@ -95,20 +86,13 @@ class advancedMemAgent:
                 {{"keywords": "keyword1, keyword2, keyword3"}}"""
             
             # Get LLM response
-        response = self.retriever_llm.llm.get_completion(prompt,response_format={"type": "json_schema", "json_schema": {
-                            "name": "response",
-                            "schema": {
-                                "type": "object",
-                                "properties": {
-                                    "keywords": {
-                                        "type": "string",
-                                    }
-                                },
-                                "required": ["keywords"],
-                                "additionalProperties": False
-                            },
-                            "strict": True
-                        }})
+        class GenerateKeywordsSignature(dspy.Signature):
+            """Given the following question, generate several keywords, using commas as the separator."""
+            content: str = dspy.InputField()
+            keywords: str = dspy.OutputField(
+                desc = "Return keywords from the input."
+            )
+        response = self.retriever_llm.llm.get_completion(prompt,response_format=GenerateKeywordsSignature)
         print("response:{}".format(response))
         try:
             response = json.loads(response)["keywords"]
@@ -168,24 +152,91 @@ class advancedMemAgent:
 
                             Question: {question} Short answer:
                             """
+        class GenerateAnswerSignature(dspy.Signature):
+            content: str = dspy.InputField()
+            answer: str = dspy.OutputField()
         response = self.memory_system.llm_controller.llm.get_completion(
-            user_prompt,response_format={"type": "json_schema", "json_schema": {
-                        "name": "response",
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "answer": {
-                                    "type": "string",
-                                }
-                            },
-                            "required": ["answer"],
-                            "additionalProperties": False
-                        },
-                        "strict": True
-                    }},temperature=temperature
+            user_prompt,response_format= GenerateAnswerSignature,temperature=temperature
         )
         # print(response)
         return response,user_prompt,raw_context
+
+@dataclass
+class MemoryEvolutionSnapshot:
+    """Captures the state of memory at a specific point in time."""
+    timestamp: str
+    turn_index: int
+    speaker: str
+    content: str
+    memory_id: str
+    memory_content: str
+    memory_keywords: List[str]
+    memory_tags: List[str]
+    memory_context: str
+    importance_score: float
+    retrieval_count: int
+    evolution_action: Optional[str] = None  # 'created', 'evolved', 'strengthened', 'updated'
+    related_memories: Optional[List[str]] = None
+
+@dataclass
+class ConversationMemoryTracker:
+    """Tracks memory evolution throughout a conversation."""
+    sample_id: int
+    conversation_id: str
+    snapshots: List[MemoryEvolutionSnapshot]
+    memory_timeline: Dict[str, List[MemoryEvolutionSnapshot]]  # memory_id -> list of snapshots
+    total_memories_created: int = 0
+    total_evolutions: int = 0
+    
+    def add_snapshot(self, snapshot: MemoryEvolutionSnapshot):
+        """Add a memory snapshot to the tracker."""
+        self.snapshots.append(snapshot)
+        
+        # Update timeline for specific memory
+        if snapshot.memory_id not in self.memory_timeline:
+            self.memory_timeline[snapshot.memory_id] = []
+        self.memory_timeline[snapshot.memory_id].append(snapshot)
+        
+        # Update counters
+        if snapshot.evolution_action == 'created':
+            self.total_memories_created += 1
+        elif snapshot.evolution_action in ['evolved', 'strengthened', 'updated']:
+            self.total_evolutions += 1
+    
+    def get_memory_evolution_summary(self) -> Dict:
+        """Get summary statistics of memory evolution."""
+        return {
+            'total_snapshots': len(self.snapshots),
+            'unique_memories': len(self.memory_timeline),
+            'total_created': self.total_memories_created,
+            'total_evolutions': self.total_evolutions,
+            'memories_by_speaker': self._get_memories_by_speaker(),
+            'evolution_actions': self._get_evolution_actions(),
+            'memory_lifespans': self._get_memory_lifespans()
+        }
+    
+    def _get_memories_by_speaker(self) -> Dict[str, int]:
+        """Count memories created by each speaker."""
+        speaker_counts = {}
+        for snapshot in self.snapshots:
+            if snapshot.evolution_action == 'created':
+                speaker_counts[snapshot.speaker] = speaker_counts.get(snapshot.speaker, 0) + 1
+        return speaker_counts
+    
+    def _get_evolution_actions(self) -> Dict[str, int]:
+        """Count different types of evolution actions."""
+        action_counts = {}
+        for snapshot in self.snapshots:
+            if snapshot.evolution_action:
+                action_counts[snapshot.evolution_action] = action_counts.get(snapshot.evolution_action, 0) + 1
+        return action_counts
+    
+    def _get_memory_lifespans(self) -> Dict[str, int]:
+        """Calculate how many turns each memory was active/evolved."""
+        lifespans = {}
+        for memory_id, timeline in self.memory_timeline.items():
+            lifespans[memory_id] = len(timeline)
+        return lifespans
 
 def setup_logger(log_file: Optional[str] = None) -> logging.Logger:
     """Set up logging configuration."""
@@ -206,7 +257,94 @@ def setup_logger(log_file: Optional[str] = None) -> logging.Logger:
     
     return logger
 
-def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] = None, ratio: float = 1.0, backend: str = "openai", temperature_c5: float = 0.5, retrieve_k: int = 10):
+def save_memory_evolution_data(memory_evolution_data: List[ConversationMemoryTracker], output_dir: str = "./memory_evolution_data"):
+    """Save memory evolution data to disk.
+    
+    Args:
+        memory_evolution_data: List of ConversationMemoryTracker objects
+        output_dir: Directory to save the data
+    """
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save complete data as pickle
+    pickle_path = os.path.join(output_dir, "memory_evolution_complete.pkl")
+    with open(pickle_path, 'wb') as f:
+        pickle.dump(memory_evolution_data, f)
+    print(f"Complete memory evolution data saved to {pickle_path}")
+    
+    # Save summary as JSON
+    summary = {
+        "total_conversations": len(memory_evolution_data),
+        "conversations": []
+    }
+    
+    for tracker in memory_evolution_data:
+        conv_summary = tracker.get_memory_evolution_summary()
+        conv_summary["conversation_id"] = tracker.conversation_id
+        conv_summary["sample_id"] = tracker.sample_id
+        summary["conversations"].append(conv_summary)
+    
+    json_path = os.path.join(output_dir, "memory_evolution_summary.json")
+    with open(json_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    print(f"Memory evolution summary saved to {json_path}")
+
+def load_memory_evolution_data(pickle_path: str) -> List[ConversationMemoryTracker]:
+    """Load memory evolution data from disk.
+    
+    Args:
+        pickle_path: Path to the pickle file containing the data
+        
+    Returns:
+        List of ConversationMemoryTracker objects
+    """
+    with open(pickle_path, 'rb') as f:
+        return pickle.load(f)
+
+def _track_memory_changes(
+    tracker: ConversationMemoryTracker,
+    memories_before: Dict,
+    memories_after: Dict,
+    turn_index: int,
+    speaker: str,
+    content: str,
+    timestamp: str
+):
+    """Track changes in memory between before and after states."""
+    # Check for new memories
+    for mem_id, memory_note in memories_after.items():
+        if mem_id not in memories_before:
+            evolution_action = "created"
+        else:
+            # Check if memory was modified
+            old_memory = memories_before[mem_id]
+            if (memory_note.keywords != old_memory.keywords or 
+                memory_note.tags != old_memory.tags or
+                memory_note.context != old_memory.context):
+                evolution_action = "evolved"
+            else:
+                evolution_action = "unchanged"
+        
+        # Create snapshot
+        snapshot = MemoryEvolutionSnapshot(
+            timestamp=timestamp,
+            turn_index=turn_index,
+            speaker=speaker,
+            content=content,
+            memory_id=mem_id,
+            memory_content=memory_note.content,
+            memory_keywords=memory_note.keywords,
+            memory_tags=memory_note.tags,
+            memory_context=memory_note.context,
+            importance_score=memory_note.importance_score,
+            retrieval_count=memory_note.retrieval_count,
+            evolution_action=evolution_action,
+            related_memories=[]
+        )
+        tracker.add_snapshot(snapshot)
+
+def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] = None, ratio: float = 1.0, backend: LanguageModelProvider = LanguageModelProvider.LANGUAGE_MODEL_PROVIDER_LITELLM_SERVER, temperature_c5: float = 0.5, retrieve_k: int = 10):
     """Evaluate the agent on the LoComo dataset.
     
     Args:
@@ -243,6 +381,9 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     total_questions = 0
     category_counts = defaultdict(int)
     
+    # Memory evolution tracking
+    memory_evolution_data = []
+    
     # Evaluate each sample
     i = 0
     error_num = 0
@@ -251,6 +392,14 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     allow_categories = [1,2,3,4,5]
     for sample_idx, sample in enumerate(samples):
         agent = advancedMemAgent(model, backend, retrieve_k, temperature_c5)
+        
+        # Initialize memory tracker for this conversation
+        memory_tracker = ConversationMemoryTracker(
+            sample_id=sample_idx,
+            conversation_id=f"sample_{sample_idx}",
+            snapshots=[],
+            memory_timeline={}
+        )
         # Create memory cache filename based on sample and session indices
         memory_cache_file = os.path.join(
             memories_dir,
@@ -290,11 +439,33 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
             logger.info(f"No cached memories found for sample {sample_idx}. Creating new memories.")
             cached_memories = None
 
-            for _,turns in sample.conversation.sessions.items():
+            turn_index = 0
+            for session_id, turns in sample.conversation.sessions.items():
                 for turn in turns.turns:
                     turn_datatime = turns.date_time
                     conversation_tmp = "Speaker "+ turn.speaker + "says : " + turn.text
-                    agent.add_memory(conversation_tmp,time=turn_datatime)
+                    
+                    # Capture memory state before adding new memory
+                    memories_before = deepcopy(agent.memory_system.memories)
+                    
+                    # Add memory
+                    agent.add_memory(conversation_tmp, time=turn_datatime)
+                    
+                    # Capture memory state after adding new memory
+                    memories_after = agent.memory_system.memories
+                    
+                    # Track memory changes
+                    _track_memory_changes(
+                        memory_tracker, 
+                        memories_before, 
+                        memories_after,
+                        turn_index,
+                        turn.speaker,
+                        conversation_tmp,
+                        turn_datatime
+                    )
+                    
+                    turn_index += 1
                     # break
                 #     i +=1
                 #     if i>2:
@@ -305,6 +476,10 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                 pickle.dump(memories_to_cache, f)
             agent.memory_system.retriever.save(retriever_cache_file,retriever_cache_embeddings_file)
             logger.info(f"\nSuccessfully cached {len(memories_to_cache)} memories")
+        
+        # Add memory tracker to evolution data
+        memory_evolution_data.append(memory_tracker)
+        logger.info(f"Memory evolution tracking: {memory_tracker.get_memory_evolution_summary()}")
             
         logger.info(f"\nProcessing sample {sample_idx + 1}/{len(samples)}")
         
@@ -357,6 +532,18 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     # Calculate aggregate metrics
     aggregate_results = aggregate_metrics(all_metrics, all_categories)
     
+    # Prepare memory evolution summary
+    memory_evolution_summary = {
+        "total_conversations": len(memory_evolution_data),
+        "overall_stats": {
+            "total_memories_created": sum(tracker.total_memories_created for tracker in memory_evolution_data),
+            "total_evolutions": sum(tracker.total_evolutions for tracker in memory_evolution_data),
+            "avg_memories_per_conversation": sum(tracker.total_memories_created for tracker in memory_evolution_data) / len(memory_evolution_data) if memory_evolution_data else 0,
+            "avg_evolutions_per_conversation": sum(tracker.total_evolutions for tracker in memory_evolution_data) / len(memory_evolution_data) if memory_evolution_data else 0
+        },
+        "per_conversation_summaries": [tracker.get_memory_evolution_summary() for tracker in memory_evolution_data]
+    }
+    
     # Prepare final results
     final_results = {
         "model": model,
@@ -366,14 +553,60 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
             str(cat): count for cat, count in category_counts.items()
         },
         "aggregate_metrics": aggregate_results,
-        "individual_results": results
+        "individual_results": results,
+        "memory_evolution": memory_evolution_summary,
+        "detailed_memory_evolution": [
+            {
+                "sample_id": tracker.sample_id,
+                "conversation_id": tracker.conversation_id,
+                "snapshots": [
+                    {
+                        "timestamp": snap.timestamp,
+                        "turn_index": snap.turn_index,
+                        "speaker": snap.speaker,
+                        "content": snap.content,
+                        "memory_id": snap.memory_id,
+                        "memory_content": snap.memory_content,
+                        "memory_keywords": snap.memory_keywords,
+                        "memory_tags": snap.memory_tags,
+                        "memory_context": snap.memory_context,
+                        "importance_score": snap.importance_score,
+                        "retrieval_count": snap.retrieval_count,
+                        "evolution_action": snap.evolution_action,
+                        "related_memories": snap.related_memories
+                    } for snap in tracker.snapshots
+                ],
+                "summary": tracker.get_memory_evolution_summary()
+            } for tracker in memory_evolution_data
+        ]
     }
     logger.info(f"Error number: {error_num}")
+    
+    # Log memory evolution summary
+    logger.info("\nMemory Evolution Summary:")
+    logger.info(f"Total conversations tracked: {memory_evolution_summary['total_conversations']}")
+    logger.info(f"Total memories created across all conversations: {memory_evolution_summary['overall_stats']['total_memories_created']}")
+    logger.info(f"Total memory evolutions: {memory_evolution_summary['overall_stats']['total_evolutions']}")
+    logger.info(f"Average memories per conversation: {memory_evolution_summary['overall_stats']['avg_memories_per_conversation']:.2f}")
+    logger.info(f"Average evolutions per conversation: {memory_evolution_summary['overall_stats']['avg_evolutions_per_conversation']:.2f}")
+    
     # Save results
     if output_path:
         with open(output_path, 'w') as f:
             json.dump(final_results, f, indent=2)
         logger.info(f"Results saved to {output_path}")
+        
+        # Save memory evolution data as separate pickle file
+        memory_evolution_path = output_path.replace('.json', '_memory_evolution.pkl')
+        with open(memory_evolution_path, 'wb') as f:
+            pickle.dump(memory_evolution_data, f)
+        logger.info(f"Memory evolution data saved to {memory_evolution_path}")
+        
+        # Save a summary of memory evolution as separate JSON file
+        memory_summary_path = output_path.replace('.json', '_memory_summary.json')
+        with open(memory_summary_path, 'w') as f:
+            json.dump(memory_evolution_summary, f, indent=2)
+        logger.info(f"Memory evolution summary saved to {memory_summary_path}")
     
     # Log summary
     logger.info("\nEvaluation Summary:")
@@ -396,15 +629,15 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate text-only agent on LoComo dataset")
     parser.add_argument("--dataset", type=str, default="data/locomo10.json",
                       help="Path to the dataset file")
-    parser.add_argument("--model", type=str, default="gpt-4o-mini",
+    parser.add_argument("--model", type=str, default="gpt-4.1-mini",
                       help="OpenAI model to use")
     parser.add_argument("--output", type=str, default=None,
                       help="Path to save evaluation results")
     parser.add_argument("--ratio", type=float, default=1.0,
                       help="Ratio of dataset to evaluate (0.0 to 1.0)")
-    parser.add_argument("--backend", type=str, default="openai",
+    parser.add_argument("--backend", type=LanguageModelProvider, default=LanguageModelProvider.LANGUAGE_MODEL_PROVIDER_LITELLM_SERVER,
                       help="Backend to use (openai or ollama)")
-    parser.add_argument("--temperature_c5", type=float, default=0.5,
+    parser.add_argument("--temperature_c5", type=float, default=0.7,
                       help="Temperature for the model")
     parser.add_argument("--retrieve_k", type=int, default=10,
                       help="Retrieve k")
